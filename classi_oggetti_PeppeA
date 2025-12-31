@@ -1,0 +1,179 @@
+# app.py
+from __future__ import annotations
+
+import argparse
+from abc import ABC
+from dataclasses import dataclass
+from typing import Dict, Iterable, List, Optional, Protocol, Tuple, runtime_checkable
+
+
+# ==========================
+# Eccezioni del dominio
+# ==========================
+
+class SupercustomError(Exception):
+    """Base per gli errori dell'app Supercustom."""
+
+
+class DatiNonValidiError(SupercustomError):
+    """Dati non validi forniti a un'API (es. ore <= 0, tariffa non positiva)."""
+
+
+class BikeNonDisponibileError(SupercustomError):
+    """La bike non è disponibile per essere noleggiata."""
+
+
+class BikeNonTrovataError(SupercustomError):
+    """Bike con id richiesto non esiste nell'inventario."""
+
+
+class ClienteNonTrovatoError(SupercustomError):
+    """Cliente con id richiesto non esiste nella rubrica."""
+
+
+# ==========================
+# Mixin di logging (opz.)
+# ==========================
+
+class LoggerMixin:
+    def log(self, msg: str) -> None:
+        print(f"[LOG] {msg}")
+
+
+# ==========================
+# Modello dominio: Bike / EBike
+# ==========================
+
+class Bike(ABC):
+    """
+    Modello base di bicicletta.
+    - @property con validazioni su tariffa_base_ora, modello, disponibile
+    - @classmethod from_dict costruttore alternativo
+    """
+
+    def __init__(self, bike_id: int, modello: str, tariffa_base_ora: float, disponibile: bool = True) -> None:
+        if bike_id < 0:
+            raise DatiNonValidiError("bike_id deve essere >= 0.")
+        self._bike_id: int = int(bike_id)
+        self.modello = modello  # setter valida
+        self.tariffa_base_ora = tariffa_base_ora  # setter valida
+        self.disponibile = disponibile  # setter valida
+
+    # --- bike_id (read-only) ---
+    @property
+    def bike_id(self) -> int:
+        return self._bike_id
+
+    # --- modello ---
+    @property
+    def modello(self) -> str:
+        return self._modello
+
+    @modello.setter
+    def modello(self, value: str) -> None:
+        if not isinstance(value, str) or not value.strip():
+            raise DatiNonValidiError("modello deve essere una stringa non vuota.")
+        self._modello = value.strip()
+
+    # --- tariffa_base_ora ---
+    @property
+    def tariffa_base_ora(self) -> float:
+        return self._tariffa_base_ora
+
+    @tariffa_base_ora.setter
+    def tariffa_base_ora(self, value: float) -> None:
+        try:
+            v = float(value)
+        except (TypeError, ValueError):
+            raise DatiNonValidiError("tariffa_base_ora deve essere numerica.")
+        if v <= 0.0:
+            raise DatiNonValidiError("tariffa_base_ora deve essere > 0.")
+        self._tariffa_base_ora = v
+
+    # --- disponibile ---
+    @property
+    def disponibile(self) -> bool:
+        return self._disponibile
+
+    @disponibile.setter
+    def disponibile(self, value: bool) -> None:
+        if not isinstance(value, bool):
+            raise DatiNonValidiError("disponibile deve essere booleano.")
+        self._disponibile = value
+
+    # --- costruttore alternativo ---
+    @classmethod
+    def from_dict(cls, data: Dict[str, object]) -> Bike:
+        """
+        Crea Bike o EBike da un dizionario.
+        Chiavi attese:
+        - tipo: "bike" | "ebike" (default "bike")
+        - bike_id: int
+        - modello: str
+        - tariffa_base_ora: float
+        - disponibile: bool (opz.)
+        - ricarica_rapida: bool (solo per EBike)
+        """
+        tipo: str = str(data.get("tipo", "bike")).lower()
+        bike_id = int(data["bike_id"])  # solleva KeyError se assente (lasciamo emergere)
+        modello = str(data["modello"])
+        tariffa = float(data["tariffa_base_ora"])
+        disponibile = bool(data.get("disponibile", True))
+
+        if tipo == "ebike":
+            ricarica = bool(data.get("ricarica_rapida", False))
+            return EBike(bike_id=bike_id, modello=modello, tariffa_base_ora=tariffa, disponibile=disponibile, ricarica_rapida=ricarica)
+        return SimpleBike(bike_id=bike_id, modello=modello, tariffa_base_ora=tariffa, disponibile=disponibile)
+
+    # --- utilità ---
+    def __repr__(self) -> str:  # pedante per debug
+        cls = self.__class__.__name__
+        return f"{cls}(bike_id={self.bike_id}, modello='{self.modello}', tariffa_base_ora={self.tariffa_base_ora:.2f}, disponibile={self.disponibile})"
+
+
+class SimpleBike(Bike):
+    """Bike standard (muscolare)."""
+    pass
+
+
+class EBike(Bike):
+    """E-bike con flag ricarica_rapida che impatta pricing EBikePricing."""
+    def __init__(self, bike_id: int, modello: str, tariffa_base_ora: float, disponibile: bool = True, ricarica_rapida: bool = False) -> None:
+        super().__init__(bike_id=bike_id, modello=modello, tariffa_base_ora=tariffa_base_ora, disponibile=disponibile)
+        self.ricarica_rapida = bool(ricarica_rapida)
+
+
+# ==========================
+# Strategie di prezzo
+# ==========================
+
+@runtime_checkable
+class PricingStrategy(Protocol):
+    def calcola(self, bike: Bike, ore: int) -> float: ...
+
+
+class StandardPricing:
+    """Prezzo = base_oraria * ore."""
+    def calcola(self, bike: Bike, ore: int) -> float:
+        if ore <= 0:
+            raise DatiNonValidiError("Le ore devono essere > 0.")
+        return bike.tariffa_base_ora * float(ore)
+
+
+class EBikePricing:
+    """
+    +20% se bike è EBike con ricarica_rapida=True
+    +10% altrimenti (vale anche per SimpleBike per confronto richiesto nei test).
+    """
+    def calcola(self, bike: Bike, ore: int) -> float:
+        if ore <= 0:
+            raise DatiNonValidiError("Le ore devono essere > 0.")
+        base = bike.tariffa_base_ora * float(ore)
+        if isinstance(bike, EBike):
+            return base * (1.20 if bike.ricarica_rapida else 1.10)
+        return base * 1.10
+
+
+class NightPromoPricing:
+    """Sconto notturno opzionale: -15% se notte
+
